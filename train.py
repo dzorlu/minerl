@@ -3,7 +3,9 @@ import json
 import select
 import time
 import logging
+import functools
 import os
+import tqdm
 
 import aicrowd_helper
 import gym
@@ -11,8 +13,24 @@ import minerl
 from utility.parser import Parser
 
 import coloredlogs
-coloredlogs.install(logging.DEBUG)
+coloredlogs.install(logging.INFO)
 
+
+# Acme dependencies
+import acme
+from acme import specs
+from acme.agents.tf import r2d3
+from acme import wrappers
+from acme.tf import networks
+from acme.agents.tf.dqfd import bsuite_demonstrations
+
+import dm_env
+
+from acme.utils import loggers
+logger = loggers.TerminalLogger(label='minerl', time_delta=10.)
+
+# number of discrete actions
+NUMBER_OF_DISCRETE_ACTIONS = 25
 # All the evaluations will be evaluated on MineRLObtainDiamond-v0 environment
 MINERL_GYM_ENV = os.getenv('MINERL_GYM_ENV', 'MineRLObtainDiamondVectorObf-v0')
 # You need to ensure that your submission is trained in under MINERL_TRAINING_MAX_STEPS steps
@@ -37,37 +55,142 @@ parser = Parser('performance/',
                 submission_timeout=MINERL_TRAINING_TIMEOUT*60,
                 initial_poll_timeout=600)
 
+def create_network(nb_actions: int = NUMBER_OF_DISCRETE_ACTIONS) -> networks.RNNCore:
+    """Creates the policy network"""
+    return networks.R2D2MineRLNetwork(nb_actions)
+
+
+def make_environment(num_actions: int, dat_loader: minerl.data.data_pipeline.DataPipeline,) -> dm_env.Environment:
+  """
+  Wrap the environment in:
+    1 - MineRLWrapper 
+        - similar to OAR but add proprioceptive features
+        - kMeans to map cont action space to a discrete one
+    2 - SinglePrecisionWrapper
+    3 - GymWrapper
+  """
+
+  env = gym.make(MINERL_GYM_ENV)
+      
+  return wrappers.wrap_all(env, [
+      wrappers.GymWrapper,
+      functools.partial(
+        wrappers.MineRLWrapper,
+          num_actions=num_actions,
+          dat_loader=dat_loader,
+      ),
+      wrappers.SinglePrecisionWrapper,
+  ])
+
+def _nested_stack(sequence: List[Any]):
+  """Stack nested elements in a sequence."""
+  return tree.map_structure(lambda *x: np.stack(x), *sequence)
+
+class DemonstrationRecorder:
+  """Records demonstrations.
+
+  A demonstration is a (observation, action, reward, discount) tuple where
+  every element is a numpy array corresponding to a full episode.
+  """
+
+  def __init__(self):
+    self._demos = []
+    self._reset_episode()
+
+  def step(self, timestep: dm_env.TimeStep, action: np.ndarray):
+    reward = np.array(timestep.reward or 0, np.float32)
+    self._episode_reward += reward
+    self._episode.append((timestep.observation, action, reward,
+                          np.array(timestep.discount or 0, np.float32)))
+
+  def record_episode(self):
+    self._demos.append(_nested_stack(self._episode))
+    self._reset_episode()
+
+  def discard_episode(self):
+    self._reset_episode()
+
+  def _reset_episode(self):
+    self._episode = []
+    self._episode_reward = 0
+
+  @property
+  def episode_reward(self):
+    return self._episode_reward
+
+  def make_tf_dataset(self):
+    types = tree.map_structure(lambda x: x.dtype, self._demos[0])
+    shapes = tree.map_structure(lambda x: x.shape, self._demos[0])
+    ds = tf.data.Dataset.from_generator(lambda: self._demos, types, shapes)
+    return ds.repeat().shuffle(len(self._demos))
+
+def build_demonstrations(dat_loader: minerl.data.data_pipeline.DataPipeline, sequence_length: int, nb_experts: int = 5):
+  # Build demonstrations.    
+  recorder = DemonstrationRecorder()
+  # replay trajectories
+  trajectories = dat_loader.get_trajectory_names()
+  for t, trajectory in enumerate(trajectories):
+    if t < nb_experts:
+      logger.write({str(t): trajectory})
+      for i, (state, a, r, next_state, done, meta) in enumerate(dat_loader.load_data(trajectory, include_metadata=True)):
+        
+        if done:
+          step_type = dm_env.StepType(2)
+        elif i == 0:
+          step_type = dm_env.StepType(0)
+        else:
+          step_type = dm_env.StepType(1)
+        ts = dm_env.TimeStep(observation=state, reward=r, step_type=step_type, discount=0)
+        recorder.step(ts, a)
+      recorder.record_episode()
+  return recorder.make_tf_dataset()
+
 def main():
     """
     This function will be called for training phase.
     """
-    # How to sample minerl data is document here:
-    # http://minerl.io/docs/tutorials/data_sampling.html
+    burn_in_length = 40
+    trace_length = 40
+    sequence_length = burn_in_length + trace_length + 1 #per R2D3 agent
+
+    # Create data loader
     data = minerl.data.make(MINERL_GYM_ENV, data_dir=MINERL_DATA_ROOT)
 
-    # Sample code for illustration, add your training code below
-    env = gym.make(MINERL_GYM_ENV)
+    # Create env
+    environment = make_environment(num_actions=30, dat_loader=data)
+    spec = specs.make_environment_spec(environment)
 
-#     actions = [env.action_space.sample() for _ in range(10)] # Just doing 10 samples in this example
-#     xposes = []
-#     for _ in range(1):
-#         obs = env.reset()
-#         done = False
-#         netr = 0
+    # Create a logger for the agent and environment loop.
+    agent_logger = loggers.TerminalLogger(label='agent', time_delta=10.)
+    env_loop_logger = loggers.TerminalLogger(label='env_loop', time_delta=10.)
 
-#         # Limiting our code to 1024 steps in this example, you can do "while not done" to run till end
-#         while not done:
+    # Build demonstrations
+    recorder = build_demonstrations(data, sequence_length)
 
-            # To get better view in your training phase, it is suggested
-            # to register progress continuously, example when 54% completed
-            # aicrowd_helper.register_progress(0.54)
+    # Construct the network.
+    network = create_network()
+    target_network = create_network()
 
-            # To fetch latest information from instance manager, you can run below when you want to know the state
-            #>> parser.update_information()
-            #>> print(parser.payload)
-            # .payload: provide AIcrowd generated json
-            # Example: {'state': 'RUNNING', 'score': {'score': 0.0, 'score_secondary': 0.0}, 'instances': {'1': {'totalNumberSteps': 2001, 'totalNumberEpisodes': 0, 'currentEnvironment': 'MineRLObtainDiamond-v0', 'state': 'IN_PROGRESS', 'episodes': [{'numTicks': 2001, 'environment': 'MineRLObtainDiamond-v0', 'rewards': 0.0, 'state': 'IN_PROGRESS'}], 'score': {'score': 0.0, 'score_secondary': 0.0}}}}
-            # .current_state: provide indepth state information avaiable as dictionary (key: instance id)
+    # sequence_length = burn_in_length + trace_length
+    agent = r2d3.R2D3(
+        environment_spec=spec,
+        network=network,
+        target_network=target_network,
+        demonstration_dataset=recorder,
+        demonstration_ratio=0.5,
+        batch_size=10,
+        samples_per_insert=2,
+        min_replay_size=10,
+        burn_in_length=burn_in_length,
+        trace_length=trace_length,
+        replay_period=4,
+        checkpoint=False,
+        logger=agent_logger
+    )
+
+    # Run the env loop
+    loop = acme.EnvironmentLoop(environment, agent)
+    loop.run(num_steps=MINERL_TRAINING_MAX_STEPS)  # pytype: disable=attribute-error
 
     # Save trained model to train/ directory
     # Training 100% Completed
