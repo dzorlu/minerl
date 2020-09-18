@@ -6,28 +6,41 @@ import logging
 import functools
 import os
 import tqdm
+from pathlib import Path
 
 import aicrowd_helper
 import gym
 import minerl
 from utility.parser import Parser
+from typing import List, Any
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.utils import to_categorical  
 
-import coloredlogs
+
+from collections import OrderedDict
+from sklearn.cluster import MiniBatchKMeans
+
+import coloredlogs, logging
 coloredlogs.install(logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 # Acme dependencies
 import acme
+import tree
 from acme import specs
+from acme import types
 from acme.agents.tf import r2d3
 from acme import wrappers
+from acme.wrappers.minerl_wrapper import OVAR
+from acme.wrappers import MineRLWrapper
 from acme.tf import networks
-from acme.agents.tf.dqfd import bsuite_demonstrations
 
 import dm_env
 
 from acme.utils import loggers
-logger = loggers.TerminalLogger(label='minerl', time_delta=10.)
+#logger = loggers.TerminalLogger(label='minerl', time_delta=10.)
 
 # number of discrete actions
 NUMBER_OF_DISCRETE_ACTIONS = 25
@@ -42,7 +55,7 @@ MINERL_TRAINING_MAX_INSTANCES = int(os.getenv('MINERL_TRAINING_MAX_INSTANCES', 5
 # Round 2: Training timeout is 4 days
 MINERL_TRAINING_TIMEOUT = int(os.getenv('MINERL_TRAINING_TIMEOUT_MINUTES', 4*24*60))
 # The dataset is available in data/ directory from repository root.
-MINERL_DATA_ROOT = os.getenv('MINERL_DATA_ROOT', 'data/')
+MINERL_DATA_ROOT = os.getenv('MINERL_DATA_ROOT', '/data/minerl')
 
 # Optional: You can view best effort status of your instances with the help of parser.py
 # This will give you current state like number of steps completed, instances launched and so on. Make your you keep a tap on the numbers to avoid breaching any limits.
@@ -93,15 +106,38 @@ class DemonstrationRecorder:
   every element is a numpy array corresponding to a full episode.
   """
 
-  def __init__(self):
+  def __init__(self, environment: dm_env.Environment):
     self._demos = []
+    self._environment = environment
+    self.k_means = environment.k_means
+    self.num_classes = self.k_means.n_clusters
+    self._prev_action: types.NestedArray 
+    self._prev_reward: types.NestedArray
     self._reset_episode()
+
+  def map_action(self, action: types.NestedArray) -> types.NestedArray:
+    # map from cont to discrete for the agent
+    action = action['vector'].reshape(1, 64)
+    action = self.k_means.predict(action)[0]
+    return action
 
   def step(self, timestep: dm_env.TimeStep, action: np.ndarray):
     reward = np.array(timestep.reward or 0, np.float32)
     self._episode_reward += reward
-    self._episode.append((timestep.observation, action, reward,
-                          np.array(timestep.discount or 0, np.float32)))
+    # this imitates the enviroment step to create data in the same format.
+    new_timestep = self._augment_observation(timestep)
+    discrete_action = self.map_action(action)
+    self._prev_action = discrete_action
+    self._prev_reward = reward
+    self._episode.append((new_timestep.observation, discrete_action, reward,
+                          np.array(new_timestep.discount or 0, np.float32)))
+
+  def _augment_observation(self, timestep: dm_env.TimeStep) -> dm_env.TimeStep:
+    ovar = OVAR(observation=timestep.observation['pov'].astype(np.float32),
+                obs_vector=timestep.observation['vector'],
+                action=self._prev_action,
+                reward=self._prev_reward)
+    return timestep._replace(observation=ovar)
 
   def record_episode(self):
     self._demos.append(_nested_stack(self._episode))
@@ -113,6 +149,10 @@ class DemonstrationRecorder:
   def _reset_episode(self):
     self._episode = []
     self._episode_reward = 0
+    self._prev_action = tree.map_structure(
+        lambda x: x.generate_value(), self._environment.action_spec())
+    self._prev_reward = tree.map_structure(
+        lambda x: x.generate_value(), self._environment.reward_spec())
 
   @property
   def episode_reward(self):
@@ -122,23 +162,32 @@ class DemonstrationRecorder:
       shape = list(shape)
       shape[0] = None
       return tuple(shape)
+  
+  def _change_type(self, _type):
+    if _type == np.dtype('float64'):
+      return np.dtype('float32')
+    else:
+      return _type
 
   def make_tf_dataset(self):
-    types = tree.map_structure(lambda x: x.dtype, self._demos[0])
+    types = tree.map_structure(lambda x: self._change_type(x.dtype), self._demos[0])
     shapes = tree.map_structure(lambda x: self._change_shape(x.shape), self._demos[0])
+    logger.info({"types": types})
     ds = tf.data.Dataset.from_generator(lambda: self._demos, types, shapes)
     return ds.repeat().shuffle(len(self._demos))
 
-def build_demonstrations(dat_loader: minerl.data.data_pipeline.DataPipeline, sequence_length: int, nb_experts: int = 5):
+def build_demonstrations(env: dm_env.Environment, 
+                         dat_loader: minerl.data.data_pipeline.DataPipeline, 
+                         nb_experts: int = 5):
   # Build demonstrations.    
-  recorder = DemonstrationRecorder()
+  recorder = DemonstrationRecorder(env)
+  recorder._reset_episode()
   # replay trajectories
   trajectories = dat_loader.get_trajectory_names()
   for t, trajectory in enumerate(trajectories):
     if t < nb_experts:
-      logger.write({str(t): trajectory})
-      for i, (state, a, r, next_state, done, meta) in enumerate(dat_loader.load_data(trajectory, include_metadata=True)):
-        
+      logger.info({str(t): trajectory})
+      for i, (state, a, r, _, done, meta) in enumerate(dat_loader.load_data(trajectory, include_metadata=True)):    
         if done:
           step_type = dm_env.StepType(2)
         elif i == 0:
@@ -147,6 +196,7 @@ def build_demonstrations(dat_loader: minerl.data.data_pipeline.DataPipeline, seq
           step_type = dm_env.StepType(1)
         ts = dm_env.TimeStep(observation=state, reward=r, step_type=step_type, discount=0)
         recorder.step(ts, a)
+      logger.info(f"recording {t} expert")
       recorder.record_episode()
   return recorder.make_tf_dataset()
 
@@ -154,15 +204,25 @@ def main():
     """
     This function will be called for training phase.
     """
+  
+    rel_path = os.path.dirname(__file__) # relative directory path
+    model_dir = os.path.join(rel_path, "train")
+    Path(model_dir).mkdir(parents=True, exist_ok=True)
+
     burn_in_length = 40
     trace_length = 40
     sequence_length = burn_in_length + trace_length + 1 #per R2D3 agent
 
     # Create data loader
-    data = minerl.data.make(MINERL_GYM_ENV, data_dir=MINERL_DATA_ROOT)
+    logger.info((MINERL_GYM_ENV, MINERL_DATA_ROOT))
+    data = minerl.data.make(MINERL_GYM_ENV, 
+                            data_dir=MINERL_DATA_ROOT, 
+                            num_workers=1,
+                            worker_batch_size=4)
 
     # Create env
-    environment = make_environment(num_actions=30, dat_loader=data)
+    logger.info("creating environment")
+    environment = make_environment(num_actions=NUMBER_OF_DISCRETE_ACTIONS, dat_loader=data)
     spec = specs.make_environment_spec(environment)
 
     # Create a logger for the agent and environment loop.
@@ -170,7 +230,9 @@ def main():
     env_loop_logger = loggers.TerminalLogger(label='env_loop', time_delta=10.)
 
     # Build demonstrations
-    demonstration_dataset = build_demonstrations(data, sequence_length)
+    logger.info("building the demonstration dataset")
+    demonstration_dataset = build_demonstrations(environment, data)
+    logger.info("demonstration dataset is built..")
 
     # Construct the network.
     network = create_network()
@@ -178,6 +240,7 @@ def main():
 
     # sequence_length = burn_in_length + trace_length
     agent = r2d3.R2D3(
+        model_directory=model_dir,
         environment_spec=spec,
         network=network,
         target_network=target_network,
@@ -200,8 +263,8 @@ def main():
     # Save trained model to train/ directory
     # Training 100% Completed
     aicrowd_helper.register_progress(1)
-    #env.close()
+    environment.close()
 
 
 if __name__ == "__main__":
-    main()
+  main()
