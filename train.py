@@ -59,6 +59,10 @@ MINERL_DATA_ROOT = os.getenv('MINERL_DATA_ROOT', '/hdd/minerl')
 
 # Optional: You can view best effort status of your instances with the help of parser.py
 # This will give you current state like number of steps completed, instances launched and so on. Make your you keep a tap on the numbers to avoid breaching any limits.
+rel_path = os.path.dirname(__file__) # relative directory path
+performance_dir = os.path.join(rel_path, "performance")
+Path(performance_dir).mkdir(parents=True, exist_ok=True)
+
 parser = Parser('performance/',
                 allowed_environment=MINERL_GYM_ENV,
                 maximum_instances=MINERL_TRAINING_MAX_INSTANCES,
@@ -73,7 +77,11 @@ def create_network(nb_actions: int = NUMBER_OF_DISCRETE_ACTIONS) -> networks.RNN
     return networks.R2D2MineRLNetwork(nb_actions)
 
 
-def make_environment(num_actions: int, dat_loader: minerl.data.data_pipeline.DataPipeline,) -> dm_env.Environment:
+def make_environment(k_means_path: str,
+                     num_actions: int = NUMBER_OF_DISCRETE_ACTIONS,
+                     dat_loader: minerl.data.data_pipeline.DataPipeline = None, 
+                     train: bool = True,
+                     minerl_gym_env: str = MINERL_GYM_ENV) -> dm_env.Environment:
   """
   Wrap the environment in:
     1 - MineRLWrapper 
@@ -83,7 +91,7 @@ def make_environment(num_actions: int, dat_loader: minerl.data.data_pipeline.Dat
     3 - GymWrapper
   """
 
-  env = gym.make(MINERL_GYM_ENV)
+  env = gym.make(minerl_gym_env)
       
   return wrappers.wrap_all(env, [
       wrappers.GymWrapper,
@@ -91,6 +99,7 @@ def make_environment(num_actions: int, dat_loader: minerl.data.data_pipeline.Dat
         wrappers.MineRLWrapper,
           num_actions=num_actions,
           dat_loader=dat_loader,
+          k_means_path=k_means_path,
       ),
       wrappers.SinglePrecisionWrapper,
   ])
@@ -206,7 +215,6 @@ def main():
 
     burn_in_length = 40
     trace_length = 40
-    sequence_length = burn_in_length + trace_length + 1 #per R2D3 agent
 
     # Create data loader
     logger.info((MINERL_GYM_ENV, MINERL_DATA_ROOT))
@@ -217,12 +225,14 @@ def main():
 
     # Create env
     logger.info("creating environment")
-    environment = make_environment(num_actions=NUMBER_OF_DISCRETE_ACTIONS, dat_loader=data)
+    environment = make_environment(num_actions=NUMBER_OF_DISCRETE_ACTIONS,
+                                   k_means_path=model_dir,
+                                   dat_loader=data)
     spec = specs.make_environment_spec(environment)
 
-    # Create a logger for the agent and environment loop.
-    agent_logger = loggers.TerminalLogger(label='agent', time_delta=10.)
-    env_loop_logger = loggers.TerminalLogger(label='env_loop', time_delta=10.)
+    # # Create a logger for the agent and environment loop.
+    # agent_logger = loggers.TerminalLogger(label='agent', time_delta=10.)
+    # env_loop_logger = loggers.TerminalLogger(label='env_loop', time_delta=10.)
 
     # Build demonstrations
     logger.info("building the demonstration dataset")
@@ -245,6 +255,7 @@ def main():
         batch_size=8,
         samples_per_insert=2,
         min_replay_size=1000,
+        max_replay_size=100_000,
         burn_in_length=burn_in_length,
         trace_length=trace_length,
         replay_period=40, # per R2D3 paper.
