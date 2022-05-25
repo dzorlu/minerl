@@ -107,7 +107,7 @@ pyasn1-modules==0.2.7
 pycparser @ file:///tmp/build/80754af9/pycparser_1594388511720/work
 pyglet==1.5.0
 Pygments @ file:///home/conda/feedstock_root/build_artifacts/pygments_1600347314331/work
-PyJWT==1.7.1
+PyJWT==2.4.0
 PyOpenGL==3.1.5
 pyOpenSSL @ file:///tmp/build/80754af9/pyopenssl_1594392929924/work
 pyparsing==2.4.7
