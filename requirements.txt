@@ -71,7 +71,7 @@ Markdown @ file:///tmp/build/80754af9/markdown_1597433240441/work
 MarkupSafe==1.1.1
 matplotlib==3.0.3
 minerl==0.3.6
-mistune==0.8.4
+mistune==2.0.3
 mizani==0.7.1
 mkl-fft==1.1.0
 mkl-random==1.1.0
