@@ -10,7 +10,7 @@ blinker==1.4
 brotlipy==0.7.0
 bsuite @ git+git://github.com/deepmind/bsuite.git@f2e6c2103247579498e2b84ca7581d8ae4632dac
 cachetools @ file:///tmp/build/80754af9/cachetools_1596822027882/work
-certifi==2020.6.20
+certifi==2022.12.7
 cffi @ file:///tmp/build/80754af9/cffi_1598370769933/work
 chardet==3.0.4
 chex==0.0.2
